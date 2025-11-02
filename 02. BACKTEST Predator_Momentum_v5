@@ -1,0 +1,206 @@
+//+------------------------------------------------------------------+
+//|                                        Predator_Momentum_v5.mq5 |
+//|                      MOTOR V5.0: DEPREDADOR DE MOMENTUM (TRAILING) |
+//|                                  
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+// Incluimos la librería estándar de Trading de MQL5
+#include <Trade\Trade.mqh>
+
+// --- PARÁMETROS DE LA ESTRATEGIA (VISIBLES EN MT5) ---
+// Estos 'input' permiten la optimización y el ajuste
+input int      EMA_Trend_Period    = 200;    // EMA para tendencia principal (Filtro de Contexto)
+input int      EMA_Pullback_Period = 50;     // EMA para zona de retroceso (El "imán" del precio)
+input int      EMA_Trigger_Period  = 3;      // EMA rápida para el gatillo de entrada (Señal de Momentum)
+input int      ADX_Period          = 14;     // Período del ADX
+input int      ADX_Threshold       = 18;     // Umbral de fuerza de tendencia (Filtro de Ruido)
+input int      ATR_Period          = 14;     // Período del ATR (Medida de Volatilidad)
+input double   ATR_SL_Multiplier   = 2.0;    // Multiplicador para el Stop Loss inicial (Riesgo Dinámico)
+input double   ATR_TS_Multiplier   = 2.5;    // Multiplicador para el Trailing Stop (Gestión de Ganancias)
+input double   Risk_Percent        = 1.0;    // Porcentaje de riesgo por operación (Gestión de Capital)
+
+// --- VARIABLES GLOBALES ---
+CTrade     trade; // Objeto de la clase CTrade para ejecutar operaciones
+bool       pullback_confirmed = false; // "Memoria" del bot: ¿Ya tocó la EMA 50?
+
+// --- HANDLES DE INDICADORES ---
+// Guardamos los "identificadores" de los indicadores para no tener que recalcularlos
+int        ema_trend_handle   = INVALID_HANDLE;
+int        ema_pullback_handle= INVALID_HANDLE;
+int        ema_trigger_handle = INVALID_HANDLE;
+int        adx_handle         = INVALID_HANDLE;
+int        atr_handle         = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+//| Función de Inicialización del EA (Se ejecuta 1 vez al inicio)    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // --- Crear "handles" (manejadores) para cada indicador ---
+   // Esto optimiza el EA, pidiendo los indicadores a MT5 una sola vez.
+   ema_trend_handle    = iMA(_Symbol, _Period, EMA_Trend_Period, 0, MODE_EMA, PRICE_CLOSE);
+   ema_pullback_handle = iMA(_Symbol, _Period, EMA_Pullback_Period, 0, MODE_EMA, PRICE_CLOSE);
+   ema_trigger_handle  = iMA(_Symbol, _Period, EMA_Trigger_Period, 0, MODE_EMA, PRICE_CLOSE);
+   adx_handle          = iADX(_Symbol, _Period, ADX_Period);
+   atr_handle          = iATR(_Symbol, _Period, ATR_Period);
+
+   // --- Verificación de Rigor ---
+   // Si algún indicador no se pudo crear, el EA falla y se detiene.
+   if(ema_trend_handle == INVALID_HANDLE || ema_pullback_handle == INVALID_HANDLE || 
+      ema_trigger_handle == INVALID_HANDLE || adx_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE)
+   {
+      Print("Error al crear los handles de los indicadores");
+      return(INIT_FAILED); // Falla la inicialización
+   }
+   
+   trade.SetExpertMagicNumber(202510); // Asigna un ID único a las operaciones de este EA
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Función de Desinicialización del EA (Se ejecuta 1 vez al final)  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // --- Liberar la memoria usada por los handles ---
+   IndicatorRelease(ema_trend_handle);
+   IndicatorRelease(ema_pullback_handle);
+   IndicatorRelease(ema_trigger_handle);
+   IndicatorRelease(adx_handle);
+   IndicatorRelease(atr_handle);
+}
+
+//+------------------------------------------------------------------+
+//| Función Principal del EA (Se ejecuta en cada tick del mercado)   |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // --- Optimización: Solo ejecutar la lógica de entrada en una nueva vela ---
+   static datetime last_bar_time = 0; // Variable estática que recuerda la última vela
+   datetime current_bar_time = (datetime)SeriesInfoInteger(_Symbol, _Period, SERIES_LASTBAR_DATE);
+   
+   if(current_bar_time == last_bar_time) // Si el tiempo de la barra es el mismo que el último tick
+   {
+      ManageTrailingStop(); // El Trailing Stop SÍ se gestiona en cada tick (para máxima precisión)
+      return; // Salir de la función, no hay nueva vela
+   }
+   // Si es una nueva vela, actualizamos el tiempo y continuamos con la lógica de entrada
+   last_bar_time = current_bar_time;
+
+   // --- Obtener datos de la última barra CERRADA (shift=1) ---
+   // Declaramos los arrays que guardarán los datos de los indicadores
+   double close[], low[], ema_trend[], ema_pullback[], ema_trigger[], adx[], atr[];
+   
+   // Declaramos los arrays para las velas anteriores (para detectar el cruce)
+   double ema_pullback_prev[2], ema_trigger_prev[2];
+   
+   // Copiamos los datos desde los "handles" a nuestros arrays
+   if(CopyClose(_Symbol, _Period, 1, 1, close) < 1 || CopyLow(_Symbol, _Period, 1, 1, low) < 1 ||
+      CopyBuffer(ema_trend_handle, 0, 1, 1, ema_trend) < 1 ||
+      CopyBuffer(ema_pullback_handle, 0, 1, 2, ema_pullback) < 2 || // Pedimos 2 valores para el cruce
+      CopyBuffer(ema_trigger_handle, 0, 1, 2, ema_trigger) < 2 ||   // Pedimos 2 valores para el cruce
+      CopyBuffer(adx_handle, 0, 1, 1, adx) < 1 ||
+      CopyBuffer(atr_handle, 0, 1, 1, atr) < 1)
+   {
+      return; // No hay suficientes datos, salir
+   }
+
+   // --- LÓGICA DE ENTRADA ---
+   
+   // Si ya hay una posición abierta, no buscar nuevas entradas
+   if(PositionsTotal() > 0) return;
+
+   // --- Filtros de Contexto ---
+   bool trend_ok = (close[0] > ema_trend[0]); // Filtro 1: El precio está por encima de la EMA 200
+   bool strength_ok = (adx[0] > ADX_Threshold); // Filtro 2: El ADX es mayor que 18 (hay tendencia)
+   
+   if(!trend_ok || !strength_ok)
+   {
+      pullback_confirmed = false; // Si la tendencia se rompe, se resetea la memoria del retroceso
+      return;
+   }
+   
+   // --- Condición de Acecho (Retroceso) ---
+   // Si el mínimo de la última vela tocó o cruzó la EMA 50
+   if(low[0] <= ema_pullback[0])
+   {
+      pullback_confirmed = true; // El bot "recuerda" que el retroceso ocurrió
+   }
+   
+   // --- Gatillo de Ejecución (Cruce de EMAs) ---
+   // Si el retroceso ya fue confirmado...
+   if(pullback_confirmed)
+   {
+      // Comprobar si la EMA 3 (rápida) cruzó POR ENCIMA de la EMA 50 (lenta) en la última vela
+      // ema_trigger[1] es la vela anterior, ema_trigger[0] es la vela más reciente
+      bool cross_up = (ema_trigger[1] < ema_pullback[1]) && (ema_trigger[0] > ema_pullback[0]);
+      
+      if(cross_up) // Si el gatillo se activa
+      {
+         // --- Calcular Riesgo y Lote ---
+         double entry_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // Precio de entrada
+         double sl_distance = atr[0] * ATR_SL_Multiplier; // Distancia del SL (ej. 2 * ATR)
+         double stop_loss = entry_price - sl_distance; // Nivel de SL
+         
+         // Calcular tamaño del lote basado en el % de riesgo
+         double risk_per_lot_currency = sl_distance * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) / _Point;
+         double lot_size = (AccountInfoDouble(ACCOUNT_BALANCE) * (Risk_Percent / 100.0)) / risk_per_lot_currency;
+         
+         // Normalizar el lotaje a los límites del bróker
+         double min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         double max_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+         double step_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+         lot_size = MathFloor(lot_size / step_vol) * step_vol;
+         lot_size = fmax(min_vol, fmin(max_vol, lot_size));
+
+         if(lot_size < min_vol)
+         {
+            Print("El tamaño del lote calculado es demasiado pequeño.");
+            return;
+         }
+
+         // Abrir la posición de compra SIN Take Profit (TP = 0.0)
+         trade.Buy(lot_size, _Symbol, entry_price, stop_loss, 0.0, "Depredador Momentum v5.0");
+         pullback_confirmed = false; // Resetear la condición después de entrar
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Función para gestionar el Trailing Stop (Se ejecuta en cada tick)|
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   if(PositionsTotal() > 0) // Si hay una operación abierta
+   {
+      // Seleccionar la posición en el símbolo actual
+      if(PositionSelect(_Symbol))
+      {
+         double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID); // Precio actual del mercado
+         double open_price = PositionGetDouble(POSITION_PRICE_OPEN); // Precio al que abrimos
+         double current_sl = PositionGetDouble(POSITION_SL); // Nivel del SL actual
+         
+         // Obtener el valor del ATR *actual* (shift=0) para el trailing
+         double atr_val[];
+         if(CopyBuffer(atr_handle, 0, 0, 1, atr_val) < 1) return; // Salir si no se puede leer el ATR
+         
+         double trailing_distance = atr_val[0] * ATR_TS_Multiplier; // Distancia del trailing (ej. 2.5 * ATR)
+
+         // Condición de Activación: La ganancia debe ser mayor que la distancia del trailing
+         if(current_price > open_price + trailing_distance)
+         {
+            // Calcular el nuevo nivel de Stop Loss
+            double new_sl = current_price - trailing_distance;
+            
+            // Solo modificar si el nuevo SL es más alto (mejor) que el actual
+            if(new_sl > current_sl)
+            {
+               // Modificar la posición para subir el SL
+               trade.PositionModify(_Symbol, new_sl, PositionGetDouble(POSITION_TP));
+            }
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
